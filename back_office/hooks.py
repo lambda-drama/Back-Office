@@ -148,6 +148,9 @@ app_license = "agpl-3.0"
 # Scheduled Tasks
 # ---------------
 
+# Scheduled Tasks
+# ---------------
+
 # scheduler_events = {
 # 	"all": [
 # 		"back_office.tasks.all"
