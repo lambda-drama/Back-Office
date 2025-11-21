@@ -487,3 +487,314 @@ def _create_repost_entries():
 	
 	return created
 
+
+@frappe.whitelist()
+def create_repost_entries_for_transactions(start_date=None, end_date=None, transaction_doctype=None, enqueue=False):
+	"""Create Repost Item Valuation entries based on transactions
+	
+	This method creates Repost Item Valuation entries for each transaction
+	with based_on="Transaction", with recreate_stock_ledgers checked. 
+	ERPNext will then handle recreating the stock ledger entries from these repost entries.
+	
+	Args:
+		start_date: Start date for transactions (default: 2000-01-01)
+		end_date: End date for transactions (default: today)
+		transaction_doctype: Filter by specific doctype (optional)
+		enqueue: If True, run in background using RQ (default: False)
+	"""
+	if enqueue:
+		# Enqueue the job to run in background
+		job = frappe.enqueue(
+			"back_office.stock_tools.api._create_repost_entries_for_transactions_background",
+			start_date=start_date,
+			end_date=end_date,
+			transaction_doctype=transaction_doctype,
+			queue="long",
+			timeout=3600,  # 1 hour timeout
+			job_name=f"Create Repost Entries for Transactions - {frappe.session.user}"
+		)
+		return {"job_id": job.id, "status": "queued"}
+	else:
+		# Run synchronously
+		return _create_repost_entries_for_transactions_background(start_date, end_date, transaction_doctype)
+
+
+def _create_repost_entries_for_transactions_background(start_date=None, end_date=None, transaction_doctype=None):
+	"""Background function to create Repost Item Valuation entries for transactions"""
+	try:
+		frappe.flags.in_progress = True
+		
+		# Get settings
+		start_date = start_date or "2000-01-01"
+		end_date = end_date or today()
+		doctype_filter = transaction_doctype if transaction_doctype else None
+		
+		# Get all transactions in chronological order
+		frappe.publish_realtime("stock_maintenance_progress", {
+			"stage": "Fetching transactions...",
+			"progress": 0
+		})
+		
+		all_transactions = _get_all_transactions_chronological(start_date, end_date, doctype_filter)
+		
+		frappe.logger().info(
+			f"Fetched {len(all_transactions) if all_transactions else 0} transactions "
+			f"for date range {start_date} to {end_date}, "
+			f"doctype filter: {doctype_filter or 'All'}"
+		)
+		
+		if not all_transactions:
+			frappe.publish_realtime("stock_maintenance_progress", {
+				"stage": "Completed",
+				"progress": 100,
+				"created_count": 0,
+				"skipped_count": 0
+			})
+			return {
+				"created_count": 0,
+				"skipped_count": 0,
+				"status": "completed"
+			}
+		
+		# Create Repost Item Valuation entries for each transaction
+		frappe.publish_realtime("stock_maintenance_progress", {
+			"stage": "Creating Repost Item Valuation entries...",
+			"progress": 0,
+			"total": len(all_transactions)
+		})
+		
+		result = _create_repost_entries_from_transactions(all_transactions)
+		created_count = result.get("created", 0)
+		skipped_count = result.get("skipped", 0)
+		skip_reasons = result.get("skip_reasons", {})
+		errors_count = result.get("errors_count", 0)
+		
+		# Publish completion
+		frappe.publish_realtime("stock_maintenance_progress", {
+			"stage": "Completed",
+			"progress": 100,
+			"created_count": created_count,
+			"skipped_count": skipped_count,
+			"skip_reasons": skip_reasons,
+			"errors_count": errors_count
+		})
+		
+		# Log completion
+		frappe.logger().info(
+			f"Repost Entries Created for Transactions: "
+			f"Created {created_count} entries, "
+			f"Skipped {skipped_count} transactions"
+		)
+		
+		return {
+			"created_count": created_count,
+			"skipped_count": skipped_count,
+			"skip_reasons": skip_reasons,
+			"errors_count": errors_count,
+			"status": "completed"
+		}
+		
+	except Exception as e:
+		error_msg = str(e)
+		frappe.log_error(frappe.get_traceback(), "Create Repost Entries for Transactions Error")
+		frappe.publish_realtime("stock_maintenance_progress", {
+			"stage": "Error",
+			"error": error_msg,
+			"progress": 0
+		})
+		raise
+	finally:
+		frappe.flags.in_progress = False
+		frappe.db.commit()
+
+
+def _get_all_transactions_chronological(start_date, end_date, doctype_filter=None):
+	"""Get all transactions in chronological order (oldest first)"""
+	# Get all stock-affecting doctypes
+	all_stock_doctypes = _get_stock_affecting_doctypes()
+	
+	# Filter by doctype_filter if provided
+	if doctype_filter:
+		all_stock_doctypes = [doctype_filter] if doctype_filter in all_stock_doctypes else []
+	
+	all_transactions = []
+	
+	for doctype in all_stock_doctypes:
+		# Check if DocType exists
+		if not frappe.db.exists("DocType", doctype):
+			continue
+		
+		try:
+			transactions = _get_transactions(doctype, start_date, end_date)
+			if transactions:
+				# Add doctype to each transaction for later reference
+				for trans in transactions:
+					trans["doctype"] = doctype
+				all_transactions.extend(transactions)
+		except Exception as e:
+			# Log error but continue with other doctypes
+			error_msg = str(e)
+			if "doesn't exist" in error_msg.lower() or ("table" in error_msg.lower() and "exist" in error_msg.lower()):
+				frappe.log_error(
+					title=f"Table does not exist for {doctype}",
+					message=f"Error: {error_msg}\n\nDoctype: {doctype}"
+				)
+			else:
+				frappe.log_error(
+					title=f"Error getting transactions for {doctype}",
+					message=f"Error: {error_msg}\n\nDoctype: {doctype}"
+				)
+			continue
+	
+	# Sort all transactions by posting_date, posting_time, and creation (oldest first)
+	all_transactions.sort(key=lambda x: (
+		x.get("posting_date", "2000-01-01"),
+		x.get("posting_time", "00:00:00"),
+		x.get("creation", "2000-01-01 00:00:00")
+	))
+	
+	return all_transactions
+
+
+def _create_repost_entries_from_transactions(transactions):
+	"""Create Repost Item Valuation entries for each transaction"""
+	created = 0
+	skipped = 0
+	errors = []
+	skip_reasons = {
+		"no_doctype_or_voucher": 0,
+		"already_exists": 0,
+		"voucher_not_found": 0,
+		"other_error": 0
+	}
+	
+	if not transactions:
+		frappe.logger().info("No transactions found to create repost entries for")
+		return {
+			"created": 0,
+			"skipped": 0
+		}
+	
+	frappe.logger().info(f"Starting to create repost entries for {len(transactions)} transactions")
+	
+	for idx, trans in enumerate(transactions, 1):
+		try:
+			doctype = trans.get("doctype")
+			voucher_no = trans.get("name")
+			
+			if not doctype or not voucher_no:
+				skipped += 1
+				skip_reasons["no_doctype_or_voucher"] += 1
+				if skipped <= 5:
+					frappe.logger().info(f"Skipping transaction {idx}: Missing doctype or voucher_no. Data: {trans}")
+				continue
+			
+			# Verify the transaction document exists and is submitted
+			if not frappe.db.exists(doctype, voucher_no):
+				skipped += 1
+				skip_reasons["voucher_not_found"] += 1
+				if skipped <= 5:
+					frappe.logger().info(f"Skipping {doctype} {voucher_no}: Document does not exist")
+				continue
+			
+			# Check if transaction is submitted (docstatus = 1)
+			docstatus = frappe.db.get_value(doctype, voucher_no, "docstatus")
+			if docstatus != 1:
+				skipped += 1
+				skip_reasons["not_submitted"] = skip_reasons.get("not_submitted", 0) + 1
+				if skipped <= 5:
+					frappe.logger().info(f"Skipping {doctype} {voucher_no}: Document not submitted (docstatus={docstatus})")
+				continue
+			
+			# Check if Repost Item Valuation entry already exists for this voucher
+			existing = frappe.db.exists(
+				"Repost Item Valuation",
+				{
+					"voucher_type": doctype,
+					"voucher_no": voucher_no,
+					"docstatus": ["!=", 2]  # Not cancelled
+				}
+			)
+			
+			if existing:
+				skipped += 1
+				skip_reasons["already_exists"] += 1
+				if skipped <= 10:
+					frappe.logger().info(f"Skipping {doctype} {voucher_no}: Repost entry already exists")
+				continue
+			
+			# Create Repost Item Valuation entry
+			repost_doc = frappe.get_doc({
+				"doctype": "Repost Item Valuation",
+				"based_on": "Transaction",
+				"voucher_type": doctype,
+				"voucher_no": voucher_no,
+				"recreate_stock_ledgers": 1,  # Check the recreate stock ledgers checkbox (plural)
+				"allow_negative_stock": 1,
+				"allow_zero_rate": 0
+			})
+			
+			repost_doc.insert(ignore_permissions=True)
+			frappe.db.commit()
+			
+			# Submit the repost entry (submit doesn't accept ignore_permissions, use frappe.flags instead)
+			frappe.flags.ignore_permissions = True
+			try:
+				repost_doc.submit()
+			finally:
+				frappe.flags.ignore_permissions = False
+			frappe.db.commit()
+			
+			created += 1
+			
+			# Log first few successful creations
+			if created <= 5:
+				frappe.logger().info(f"Created repost entry for {doctype} {voucher_no}: {repost_doc.name}")
+			
+			# Progress update every 50 transactions
+			if idx % 50 == 0:
+				progress_pct = int((idx / len(transactions)) * 100) if transactions else 0
+				frappe.publish_realtime(
+					"stock_maintenance_progress",
+					{
+						"stage": "Creating Repost Item Valuation entries...",
+						"progress": progress_pct,
+						"current": idx,
+						"total": len(transactions)
+					}
+				)
+				frappe.db.commit()
+				
+		except Exception as e:
+			error_msg = f"{trans.get('doctype', 'Unknown')} {trans.get('name', 'Unknown')}: {str(e)}"
+			errors.append(error_msg)
+			skip_reasons["other_error"] += 1
+			frappe.log_error(
+				title=f"Error creating repost entry for {trans.get('doctype', 'Unknown')} {trans.get('name', 'Unknown')}",
+				message=f"Error: {str(e)}\n\nTraceback:\n{frappe.get_traceback()}\n\nTransaction data: {trans}"
+			)
+			frappe.db.rollback()
+			skipped += 1
+	
+	frappe.db.commit()
+	
+	# Log summary
+	frappe.logger().info(
+		f"Repost entries creation completed. "
+		f"Created: {created}, Skipped: {skipped}. "
+		f"Skip reasons: {skip_reasons}"
+	)
+	
+	if errors:
+		frappe.log_error(
+			f"Total errors: {len(errors)}\n\n" + "\n".join(errors[:20]),  # Log first 20 errors
+			"Create Repost Entries - Transaction Errors"
+		)
+	
+	return {
+		"created": created,
+		"skipped": skipped,
+		"skip_reasons": skip_reasons,
+		"errors_count": len(errors)
+	}
+
