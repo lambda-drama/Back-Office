@@ -11,6 +11,20 @@ except ImportError:
 	create_repost_item_valuation_entry = None
 
 
+def _get_item_based_reposting_setting():
+	"""Get item_based_reposting setting from Stock Reposting Settings doctype"""
+	try:
+		# Try to get the setting from Stock Reposting Settings (single doctype)
+		if frappe.db.exists("DocType", "Stock Reposting Settings"):
+			setting = frappe.get_single("Stock Reposting Settings")
+			return getattr(setting, "item_based_reposting", False)
+	except Exception:
+		pass
+	
+	# Default to False if setting doesn't exist
+	return False
+
+
 @frappe.whitelist()
 def repost_and_create_sles(start_date=None, end_date=None, transaction_doctype=None, enqueue=False):
 	"""Main API method to recreate SLEs and create repost entries
@@ -656,8 +670,61 @@ def _get_all_transactions_chronological(start_date, end_date, doctype_filter=Non
 	return all_transactions
 
 
+def _get_item_warehouse_combinations(doctype, voucher_no):
+	"""Extract unique item-warehouse combinations from a transaction"""
+	try:
+		doc = frappe.get_doc(doctype, voucher_no)
+		item_warehouses = set()
+		
+		# Get items from the document
+		items = []
+		if hasattr(doc, "items") and doc.items:
+			items = doc.items
+		elif hasattr(doc, "reconciliation_items") and doc.reconciliation_items:
+			items = doc.reconciliation_items
+		elif hasattr(doc, "item_code") and doc.item_code:
+			# Single item document
+			items = [doc]
+		
+		# Extract item_code and warehouse from each item
+		for item in items:
+			item_code = getattr(item, "item_code", None)
+			warehouse = getattr(item, "warehouse", None) or getattr(item, "target_warehouse", None) or getattr(item, "source_warehouse", None)
+			
+			# For Stock Entry, check both source and target warehouses
+			if doctype == "Stock Entry":
+				source_warehouse = getattr(item, "s_warehouse", None)
+				target_warehouse = getattr(item, "t_warehouse", None)
+				
+				if item_code and source_warehouse:
+					item_warehouses.add((item_code, source_warehouse))
+				if item_code and target_warehouse:
+					item_warehouses.add((item_code, target_warehouse))
+			else:
+				if item_code and warehouse:
+					item_warehouses.add((item_code, warehouse))
+		
+		return list(item_warehouses)
+	except Exception as e:
+		frappe.logger().error(f"Error extracting item-warehouse combinations from {doctype} {voucher_no}: {str(e)}")
+		return []
+
+
 def _create_repost_entries_from_transactions(transactions):
-	"""Create Repost Item Valuation entries for each transaction"""
+	"""Create Repost Item Valuation entries for each transaction or per item based on setting
+	
+	When item_based_reposting is False (transaction-based):
+		- Creates one repost entry per transaction with based_on="Transaction"
+		- Each repost entry directly recreates stock ledger entries for that specific transaction
+		- Uses recreate_stock_ledgers=1 to ensure SLEs are created
+	
+	When item_based_reposting is True (item-based):
+		- FIRST: Ensures Stock Ledger Entries (SLEs) exist for each transaction by calling update_stock_ledger()
+		- THEN: Creates repost entries per item-warehouse combination with based_on="Item and Warehouse"
+		- Each repost entry processes ALL existing SLEs for that item-warehouse from posting_date onwards
+		- Stock ledger entries are updated/recalculated when the repost entry is processed by ERPNext's background job
+		- This ensures that item-based repost entries have SLEs to process (they don't create new SLEs, only process existing ones)
+	"""
 	created = 0
 	skipped = 0
 	errors = []
@@ -675,7 +742,9 @@ def _create_repost_entries_from_transactions(transactions):
 			"skipped": 0
 		}
 	
-	frappe.logger().info(f"Starting to create repost entries for {len(transactions)} transactions")
+	# Get the item_based_reposting setting
+	item_based_reposting = _get_item_based_reposting_setting()
+	frappe.logger().info(f"Starting to create repost entries for {len(transactions)} transactions. Item-based reposting: {item_based_reposting}")
 	
 	for idx, trans in enumerate(transactions, 1):
 		try:
@@ -706,50 +775,163 @@ def _create_repost_entries_from_transactions(transactions):
 					frappe.logger().info(f"Skipping {doctype} {voucher_no}: Document not submitted (docstatus={docstatus})")
 				continue
 			
-			# Check if Repost Item Valuation entry already exists for this voucher
-			existing = frappe.db.exists(
-				"Repost Item Valuation",
-				{
+			if item_based_reposting:
+				# Item-based reposting: First ensure SLEs exist, then create repost entries per item-warehouse
+				# IMPORTANT: Item-based repost entries only process existing SLEs, so we must ensure
+				# SLEs are created first for the transactions, then create repost entries per item-warehouse
+				
+				# Step 1: Ensure Stock Ledger Entries exist for this transaction
+				try:
+					doc = frappe.get_doc(doctype, voucher_no)
+					
+					# Check if SLEs already exist
+					existing_sles_count = frappe.db.count(
+						"Stock Ledger Entry",
+						{
+							"voucher_type": doctype,
+							"voucher_no": voucher_no,
+							"is_cancelled": 0
+						}
+					)
+					
+					# If no SLEs exist, create them first
+					if existing_sles_count == 0:
+						if hasattr(doc, "update_stock_ledger"):
+							doc.update_stock_ledger(allow_negative_stock=True)
+							frappe.db.commit()
+							frappe.logger().info(f"Created SLEs for {doctype} {voucher_no} before item-based reposting")
+						else:
+							# Document doesn't have update_stock_ledger method, skip
+							skipped += 1
+							skip_reasons["no_update_stock_ledger"] = skip_reasons.get("no_update_stock_ledger", 0) + 1
+							if skipped <= 5:
+								frappe.logger().info(f"Skipping {doctype} {voucher_no}: No update_stock_ledger method")
+							continue
+				except Exception as sle_error:
+					error_msg = f"Error creating SLEs for {doctype} {voucher_no}: {str(sle_error)}"
+					errors.append(error_msg)
+					frappe.log_error(
+						title=f"Error creating SLEs for {doctype} {voucher_no}",
+						message=f"Error: {str(sle_error)}\n\nTraceback:\n{frappe.get_traceback()}"
+					)
+					frappe.db.rollback()
+					skipped += 1
+					skip_reasons["sle_creation_error"] = skip_reasons.get("sle_creation_error", 0) + 1
+					continue
+				
+				# Step 2: Get item-warehouse combinations and create repost entries
+				item_warehouses = _get_item_warehouse_combinations(doctype, voucher_no)
+				
+				if not item_warehouses:
+					skipped += 1
+					skip_reasons["no_items"] = skip_reasons.get("no_items", 0) + 1
+					if skipped <= 5:
+						frappe.logger().info(f"Skipping {doctype} {voucher_no}: No item-warehouse combinations found")
+					continue
+				
+				# Create repost entry for each item-warehouse combination
+				transaction_created = 0
+				for item_code, warehouse in item_warehouses:
+					try:
+						# Check if repost entry already exists and is queued
+						existing = frappe.db.exists(
+							"Repost Item Valuation",
+							{
+								"item_code": item_code,
+								"warehouse": warehouse,
+								"posting_date": "1900-01-01",
+								"docstatus": 1,
+								"status": ["in", ["Queued", "In Progress"]]
+							}
+						)
+						
+						if existing:
+							continue  # Skip if already exists
+						
+						# Create Repost Item Valuation entry for item-warehouse
+						# Note: create_repost_item_valuation_entry automatically creates and submits the entry
+						# When submitted, it will process all transactions for this item-warehouse from posting_date
+						# and create/update stock ledger entries chronologically
+						if not create_repost_item_valuation_entry:
+							frappe.throw(_("create_repost_item_valuation_entry function not available. Please ensure ERPNext is installed."))
+						
+						create_repost_item_valuation_entry({
+							"based_on": "Item and Warehouse",
+							"item_code": item_code,
+							"warehouse": warehouse,
+							"posting_date": "1900-01-01",  # Start from beginning - will process all transactions for this item-warehouse
+							"posting_time": "00:01",
+							"allow_negative_stock": 1,
+							"allow_zero_rate": 0
+						})
+						
+						transaction_created += 1
+						created += 1
+						
+					except Exception as item_error:
+						error_msg = f"{doctype} {voucher_no} - {item_code}/{warehouse}: {str(item_error)}"
+						errors.append(error_msg)
+						frappe.log_error(
+							title=f"Error creating repost entry for {item_code} - {warehouse}",
+							message=f"Error: {str(item_error)}\n\nTransaction: {doctype} {voucher_no}"
+						)
+						frappe.db.rollback()
+				
+				if transaction_created > 0:
+					frappe.db.commit()
+					# Log first few successful creations
+					if created <= 5:
+						frappe.logger().info(f"Created {transaction_created} repost entries for {doctype} {voucher_no} (item-based)")
+				else:
+					skipped += 1
+					skip_reasons["already_exists"] += 1
+				
+			else:
+				# Transaction-based reposting: Create one repost entry per transaction (original behavior)
+				# Check if Repost Item Valuation entry already exists for this voucher
+				existing = frappe.db.exists(
+					"Repost Item Valuation",
+					{
+						"voucher_type": doctype,
+						"voucher_no": voucher_no,
+						"docstatus": ["!=", 2]  # Not cancelled
+					}
+				)
+				
+				if existing:
+					skipped += 1
+					skip_reasons["already_exists"] += 1
+					if skipped <= 10:
+						frappe.logger().info(f"Skipping {doctype} {voucher_no}: Repost entry already exists")
+					continue
+				
+				# Create Repost Item Valuation entry
+				repost_doc = frappe.get_doc({
+					"doctype": "Repost Item Valuation",
+					"based_on": "Transaction",
 					"voucher_type": doctype,
 					"voucher_no": voucher_no,
-					"docstatus": ["!=", 2]  # Not cancelled
-				}
-			)
-			
-			if existing:
-				skipped += 1
-				skip_reasons["already_exists"] += 1
-				if skipped <= 10:
-					frappe.logger().info(f"Skipping {doctype} {voucher_no}: Repost entry already exists")
-				continue
-			
-			# Create Repost Item Valuation entry
-			repost_doc = frappe.get_doc({
-				"doctype": "Repost Item Valuation",
-				"based_on": "Transaction",
-				"voucher_type": doctype,
-				"voucher_no": voucher_no,
-				"recreate_stock_ledgers": 1,  # Check the recreate stock ledgers checkbox (plural)
-				"allow_negative_stock": 1,
-				"allow_zero_rate": 0
-			})
-			
-			repost_doc.insert(ignore_permissions=True)
-			frappe.db.commit()
-			
-			# Submit the repost entry (submit doesn't accept ignore_permissions, use frappe.flags instead)
-			frappe.flags.ignore_permissions = True
-			try:
-				repost_doc.submit()
-			finally:
-				frappe.flags.ignore_permissions = False
-			frappe.db.commit()
-			
-			created += 1
-			
-			# Log first few successful creations
-			if created <= 5:
-				frappe.logger().info(f"Created repost entry for {doctype} {voucher_no}: {repost_doc.name}")
+					"recreate_stock_ledgers": 1,  # Check the recreate stock ledgers checkbox (plural)
+					"allow_negative_stock": 1,
+					"allow_zero_rate": 0
+				})
+				
+				repost_doc.insert(ignore_permissions=True)
+				frappe.db.commit()
+				
+				# Submit the repost entry (submit doesn't accept ignore_permissions, use frappe.flags instead)
+				frappe.flags.ignore_permissions = True
+				try:
+					repost_doc.submit()
+				finally:
+					frappe.flags.ignore_permissions = False
+				frappe.db.commit()
+				
+				created += 1
+				
+				# Log first few successful creations
+				if created <= 5:
+					frappe.logger().info(f"Created repost entry for {doctype} {voucher_no}: {repost_doc.name}")
 			
 			# Progress update every 50 transactions
 			if idx % 50 == 0:
