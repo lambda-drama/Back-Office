@@ -670,6 +670,102 @@ def _get_all_transactions_chronological(start_date, end_date, doctype_filter=Non
 	return all_transactions
 
 
+def _create_stock_reconciliation_sles(doc):
+	"""Create Stock Ledger Entries for Stock Reconciliation using stored document values.
+	
+	This is needed because Stock Reconciliation's update_stock_ledger() recalculates
+	qty_diff based on CURRENT bin values, not the stored document values. When called
+	later (after stock has changed), it may result in incorrect or no SLEs being created.
+	
+	This function creates SLEs using the STORED qty and current_qty values from the document.
+	
+	Returns:
+		dict: {
+			"created": int,  # Number of SLEs created
+			"failed_items": list  # List of dicts with failed item details
+		}
+	"""
+	from frappe.utils import flt
+	
+	sles_created = 0
+	failed_items = []
+	
+	# Get items from Stock Reconciliation
+	items = doc.items if hasattr(doc, "items") and doc.items else []
+	
+	for item in items:
+		item_code = getattr(item, "item_code", None)
+		warehouse = getattr(item, "warehouse", None)
+		
+		if not item_code or not warehouse:
+			continue
+		
+		# Use STORED values from the document, not recalculated ones
+		qty = flt(getattr(item, "qty", 0))
+		current_qty = flt(getattr(item, "current_qty", 0))
+		qty_diff = qty - current_qty
+		
+		# Skip if no difference
+		if qty_diff == 0:
+			continue
+		
+		try:
+			# Get valuation rate - use stored value or fetch from item
+			valuation_rate = flt(getattr(item, "valuation_rate", 0))
+			if not valuation_rate:
+				valuation_rate = frappe.db.get_value("Item", item_code, "valuation_rate") or 0
+			
+			# Get serial/batch info if applicable
+			serial_no = getattr(item, "serial_no", None)
+			batch_no = getattr(item, "batch_no", None)
+			
+			# Create Stock Ledger Entry
+			sle = frappe.get_doc({
+				"doctype": "Stock Ledger Entry",
+				"item_code": item_code,
+				"warehouse": warehouse,
+				"posting_date": doc.posting_date,
+				"posting_time": doc.posting_time,
+				"voucher_type": "Stock Reconciliation",
+				"voucher_no": doc.name,
+				"voucher_detail_no": item.name,
+				"actual_qty": qty_diff,
+				"qty_after_transaction": qty,
+				"incoming_rate": valuation_rate if qty_diff > 0 else 0,
+				"valuation_rate": valuation_rate,
+				"stock_value": qty * valuation_rate,
+				"stock_value_difference": qty_diff * valuation_rate,
+				"company": doc.company,
+				"batch_no": batch_no,
+				"serial_no": serial_no,
+				"is_cancelled": 0,
+				"docstatus": 1
+			})
+			
+			# Set additional fields if they exist
+			if hasattr(item, "serial_and_batch_bundle") and item.serial_and_batch_bundle:
+				sle.serial_and_batch_bundle = item.serial_and_batch_bundle
+			
+			sle.flags.ignore_permissions = True
+			sle.flags.ignore_validate = True
+			sle.flags.ignore_links = True
+			sle.db_insert()
+			
+			sles_created += 1
+		except Exception as e:
+			# Collect failed item details
+			failed_items.append({
+				"item_code": item_code,
+				"warehouse": warehouse,
+				"error": str(e)
+			})
+	
+	return {
+		"created": sles_created,
+		"failed_items": failed_items
+	}
+
+
 def _get_item_warehouse_combinations(doctype, voucher_no):
 	"""Extract unique item-warehouse combinations from a transaction"""
 	try:
@@ -724,10 +820,20 @@ def _create_repost_entries_from_transactions(transactions):
 		- Each repost entry processes ALL existing SLEs for that item-warehouse from posting_date onwards
 		- Stock ledger entries are updated/recalculated when the repost entry is processed by ERPNext's background job
 		- This ensures that item-based repost entries have SLEs to process (they don't create new SLEs, only process existing ones)
+		
+		SPECIAL CASE - Stock Reconciliation:
+		- Stock Reconciliation's update_stock_ledger() recalculates qty_diff based on CURRENT bin values,
+		  not the stored document values. This causes issues when called later after stock has changed.
+		- For Stock Reconciliation, we manually create SLEs using the stored document values (qty, current_qty)
+		  via _create_stock_reconciliation_sles(), then continue with item-based reposting.
 	"""
 	created = 0
 	skipped = 0
 	errors = []
+	# Collect failures for item-based reposting (structured format)
+	sle_creation_failures = []  # List of dicts: {doctype, voucher_no, item_code, warehouse, error, reason}
+	repost_entry_failures = []  # List of dicts: {doctype, voucher_no, item_code, warehouse, error, reason}
+	skipped_items = []  # List of dicts: {doctype, voucher_no, item_code, warehouse, reason} for tracking skipped items
 	skip_reasons = {
 		"no_doctype_or_voucher": 0,
 		"already_exists": 0,
@@ -796,10 +902,119 @@ def _create_repost_entries_from_transactions(transactions):
 					
 					# If no SLEs exist, create them first
 					if existing_sles_count == 0:
-						if hasattr(doc, "update_stock_ledger"):
-							doc.update_stock_ledger(allow_negative_stock=True)
-							frappe.db.commit()
-							frappe.logger().info(f"Created SLEs for {doctype} {voucher_no} before item-based reposting")
+						if doctype == "Stock Reconciliation":
+							# SPECIAL CASE: Stock Reconciliation
+							# update_stock_ledger() recalculates qty_diff based on CURRENT bin values,
+							# not the stored values. We create SLEs manually using stored document values.
+							sles_result = _create_stock_reconciliation_sles(doc)
+							sles_created = sles_result.get("created", 0)
+							failed_items = sles_result.get("failed_items", [])
+							
+							# Collect failed items
+							for failed_item in failed_items:
+								sle_creation_failures.append({
+									"doctype": doctype,
+									"voucher_no": voucher_no,
+									"item_code": failed_item.get("item_code", "N/A"),
+									"warehouse": failed_item.get("warehouse", "N/A"),
+									"error": failed_item.get("error", "Unknown error"),
+									"reason": "Stock Reconciliation SLE creation failed"
+								})
+							
+							if sles_created > 0:
+								frappe.db.commit()
+								frappe.logger().info(f"Manually created {sles_created} SLEs for Stock Reconciliation {voucher_no}")
+							else:
+								# No SLEs created - all items have qty_diff = 0 or all failed
+								if not failed_items:
+									# All items have qty_diff = 0 (not an error)
+									skipped += 1
+									skip_reasons["no_sle_needed"] = skip_reasons.get("no_sle_needed", 0) + 1
+									if skipped <= 5:
+										frappe.logger().info(f"Skipping {doctype} {voucher_no}: No SLEs needed (qty_diff = 0 for all items)")
+									continue
+								else:
+									# All items failed - skip transaction
+									skipped += 1
+									skip_reasons["sle_creation_error"] = skip_reasons.get("sle_creation_error", 0) + 1
+									continue
+						elif hasattr(doc, "update_stock_ledger"):
+							try:
+								doc.update_stock_ledger(allow_negative_stock=True)
+								frappe.db.commit()
+								
+								# Verify that SLEs were actually created
+								new_sles_count = frappe.db.count(
+									"Stock Ledger Entry",
+									{
+										"voucher_type": doctype,
+										"voucher_no": voucher_no,
+										"is_cancelled": 0
+									}
+								)
+								
+								if new_sles_count == 0:
+									# No SLEs were created - track all items as failed
+									item_warehouses = _get_item_warehouse_combinations(doctype, voucher_no)
+									error_msg = "No Stock Ledger Entries were created (items may have zero quantity or invalid data)"
+									
+									if not item_warehouses:
+										sle_creation_failures.append({
+											"doctype": doctype,
+											"voucher_no": voucher_no,
+											"item_code": "Multiple/Unknown",
+											"warehouse": "Multiple/Unknown",
+											"error": error_msg,
+											"reason": "No SLEs created"
+										})
+									else:
+										# Log failure for each item-warehouse combination
+										for item_code, warehouse in item_warehouses:
+											sle_creation_failures.append({
+												"doctype": doctype,
+												"voucher_no": voucher_no,
+												"item_code": item_code,
+												"warehouse": warehouse,
+												"error": error_msg,
+												"reason": "No SLEs created"
+											})
+									
+									skipped += 1
+									skip_reasons["sle_creation_error"] = skip_reasons.get("sle_creation_error", 0) + 1
+									continue
+								else:
+									frappe.logger().info(f"Created {new_sles_count} SLEs for {doctype} {voucher_no} before item-based reposting")
+							except Exception as sle_error:
+								# Get item-warehouse combinations to report which items failed
+								item_warehouses = _get_item_warehouse_combinations(doctype, voucher_no)
+								error_msg = str(sle_error)
+								
+								# If we can't determine specific items, log the whole transaction
+								if not item_warehouses:
+									sle_creation_failures.append({
+										"doctype": doctype,
+										"voucher_no": voucher_no,
+										"item_code": "Multiple/Unknown",
+										"warehouse": "Multiple/Unknown",
+										"error": error_msg,
+										"reason": "Exception during SLE creation"
+									})
+								else:
+									# Log failure for each item-warehouse combination
+									for item_code, warehouse in item_warehouses:
+										sle_creation_failures.append({
+											"doctype": doctype,
+											"voucher_no": voucher_no,
+											"item_code": item_code,
+											"warehouse": warehouse,
+											"error": error_msg,
+											"reason": "Exception during SLE creation"
+										})
+								
+								frappe.db.rollback()
+								skipped += 1
+								skip_reasons["sle_creation_error"] = skip_reasons.get("sle_creation_error", 0) + 1
+								continue
 						else:
 							# Document doesn't have update_stock_ledger method, skip
 							skipped += 1
@@ -808,12 +1023,40 @@ def _create_repost_entries_from_transactions(transactions):
 								frappe.logger().info(f"Skipping {doctype} {voucher_no}: No update_stock_ledger method")
 							continue
 				except Exception as sle_error:
-					error_msg = f"Error creating SLEs for {doctype} {voucher_no}: {str(sle_error)}"
-					errors.append(error_msg)
-					frappe.log_error(
-						title=f"Error creating SLEs for {doctype} {voucher_no}",
-						message=f"Error: {str(sle_error)}\n\nTraceback:\n{frappe.get_traceback()}"
-					)
+					# General exception - try to get item details
+					error_msg = str(sle_error)
+					try:
+						item_warehouses = _get_item_warehouse_combinations(doctype, voucher_no)
+						if item_warehouses:
+							for item_code, warehouse in item_warehouses:
+								sle_creation_failures.append({
+									"doctype": doctype,
+									"voucher_no": voucher_no,
+									"item_code": item_code,
+									"warehouse": warehouse,
+									"error": error_msg,
+									"reason": "General exception during SLE creation"
+								})
+						else:
+							sle_creation_failures.append({
+								"doctype": doctype,
+								"voucher_no": voucher_no,
+								"item_code": "Unknown",
+								"warehouse": "Unknown",
+								"error": error_msg,
+								"reason": "General exception during SLE creation"
+							})
+					except:
+						# If we can't get item details, log with unknown
+						sle_creation_failures.append({
+							"doctype": doctype,
+							"voucher_no": voucher_no,
+							"item_code": "Unknown",
+							"warehouse": "Unknown",
+							"error": error_msg,
+							"reason": "General exception during SLE creation"
+						})
+					
 					frappe.db.rollback()
 					skipped += 1
 					skip_reasons["sle_creation_error"] = skip_reasons.get("sle_creation_error", 0) + 1
@@ -823,6 +1066,14 @@ def _create_repost_entries_from_transactions(transactions):
 				item_warehouses = _get_item_warehouse_combinations(doctype, voucher_no)
 				
 				if not item_warehouses:
+					# Track skipped transaction
+					skipped_items.append({
+						"doctype": doctype,
+						"voucher_no": voucher_no,
+						"item_code": "N/A",
+						"warehouse": "N/A",
+						"reason": "No item-warehouse combinations found"
+					})
 					skipped += 1
 					skip_reasons["no_items"] = skip_reasons.get("no_items", 0) + 1
 					if skipped <= 5:
@@ -846,6 +1097,14 @@ def _create_repost_entries_from_transactions(transactions):
 						)
 						
 						if existing:
+							# Track skipped items
+							skipped_items.append({
+								"doctype": doctype,
+								"voucher_no": voucher_no,
+								"item_code": item_code,
+								"warehouse": warehouse,
+								"reason": "Repost entry already exists"
+							})
 							continue  # Skip if already exists
 						
 						# Create Repost Item Valuation entry for item-warehouse
@@ -869,12 +1128,15 @@ def _create_repost_entries_from_transactions(transactions):
 						created += 1
 						
 					except Exception as item_error:
-						error_msg = f"{doctype} {voucher_no} - {item_code}/{warehouse}: {str(item_error)}"
-						errors.append(error_msg)
-						frappe.log_error(
-							title=f"Error creating repost entry for {item_code} - {warehouse}",
-							message=f"Error: {str(item_error)}\n\nTransaction: {doctype} {voucher_no}"
-						)
+						# Collect failure instead of logging immediately
+						repost_entry_failures.append({
+							"doctype": doctype,
+							"voucher_no": voucher_no,
+							"item_code": item_code,
+							"warehouse": warehouse,
+							"error": str(item_error),
+							"reason": "Exception during repost entry creation"
+						})
 						frappe.db.rollback()
 				
 				if transaction_created > 0:
@@ -967,6 +1229,106 @@ def _create_repost_entries_from_transactions(transactions):
 		f"Skip reasons: {skip_reasons}"
 	)
 	
+	# Debug log for item-based reposting
+	if item_based_reposting:
+		frappe.logger().info(
+			f"Item-based reposting summary: "
+			f"SLE failures: {len(sle_creation_failures)}, "
+			f"Repost entry failures: {len(repost_entry_failures)}, "
+			f"Skipped items: {len(skipped_items)}"
+		)
+	
+	# Create consolidated error log for item-based reposting failures and skipped items
+	if item_based_reposting and (sle_creation_failures or repost_entry_failures or skipped_items):
+		error_message_parts = []
+		
+		if sle_creation_failures:
+			error_message_parts.append(f"\n{'='*80}")
+			error_message_parts.append(f"STOCK LEDGER ENTRY CREATION FAILURES ({len(sle_creation_failures)} items)")
+			error_message_parts.append(f"{'='*80}\n")
+			error_message_parts.append(f"{'Transaction':<35} {'Item Code':<25} {'Warehouse':<25} {'Reason':<30} {'Error'}")
+			error_message_parts.append("-" * 140)
+			
+			for failure in sle_creation_failures:
+				transaction = f"{failure['doctype']} - {failure['voucher_no']}"
+				if len(transaction) > 34:
+					transaction = transaction[:31] + "..."
+				item_code = failure.get('item_code', 'N/A')
+				if len(item_code) > 24:
+					item_code = item_code[:21] + "..."
+				warehouse = failure.get('warehouse', 'N/A')
+				if len(warehouse) > 24:
+					warehouse = warehouse[:21] + "..."
+				reason = failure.get('reason', 'Unknown')
+				if len(reason) > 29:
+					reason = reason[:26] + "..."
+				error = failure.get('error', 'Unknown error')
+				# Truncate long errors
+				if len(error) > 50:
+					error = error[:47] + "..."
+				error_message_parts.append(f"{transaction:<35} {item_code:<25} {warehouse:<25} {reason:<30} {error}")
+		
+		if repost_entry_failures:
+			error_message_parts.append(f"\n{'='*80}")
+			error_message_parts.append(f"REPOST ITEM VALUATION ENTRY CREATION FAILURES ({len(repost_entry_failures)} items)")
+			error_message_parts.append(f"{'='*80}\n")
+			error_message_parts.append(f"{'Transaction':<35} {'Item Code':<25} {'Warehouse':<25} {'Reason':<30} {'Error'}")
+			error_message_parts.append("-" * 140)
+			
+			for failure in repost_entry_failures:
+				transaction = f"{failure['doctype']} - {failure['voucher_no']}"
+				if len(transaction) > 34:
+					transaction = transaction[:31] + "..."
+				item_code = failure.get('item_code', 'N/A')
+				if len(item_code) > 24:
+					item_code = item_code[:21] + "..."
+				warehouse = failure.get('warehouse', 'N/A')
+				if len(warehouse) > 24:
+					warehouse = warehouse[:21] + "..."
+				reason = failure.get('reason', 'Unknown')
+				if len(reason) > 29:
+					reason = reason[:26] + "..."
+				error = failure.get('error', 'Unknown error')
+				# Truncate long errors
+				if len(error) > 50:
+					error = error[:47] + "..."
+				error_message_parts.append(f"{transaction:<35} {item_code:<25} {warehouse:<25} {reason:<30} {error}")
+		
+		if skipped_items:
+			error_message_parts.append(f"\n{'='*80}")
+			error_message_parts.append(f"SKIPPED ITEMS ({len(skipped_items)} items)")
+			error_message_parts.append(f"{'='*80}\n")
+			error_message_parts.append(f"{'Transaction':<35} {'Item Code':<25} {'Warehouse':<25} {'Reason'}")
+			error_message_parts.append("-" * 90)
+			
+			for skipped in skipped_items:
+				transaction = f"{skipped['doctype']} - {skipped['voucher_no']}"
+				if len(transaction) > 34:
+					transaction = transaction[:31] + "..."
+				item_code = skipped.get('item_code', 'N/A')
+				if len(item_code) > 24:
+					item_code = item_code[:21] + "..."
+				warehouse = skipped.get('warehouse', 'N/A')
+				if len(warehouse) > 24:
+					warehouse = warehouse[:21] + "..."
+				reason = skipped.get('reason', 'Unknown')
+				error_message_parts.append(f"{transaction:<35} {item_code:<25} {warehouse:<25} {reason}")
+		
+		error_message_parts.append(f"\n{'='*80}")
+		error_message_parts.append(f"SUMMARY:")
+		error_message_parts.append(f"  - SLE Creation Failures: {len(sle_creation_failures)}")
+		error_message_parts.append(f"  - Repost Entry Creation Failures: {len(repost_entry_failures)}")
+		error_message_parts.append(f"  - Skipped Items: {len(skipped_items)}")
+		error_message_parts.append(f"  - Total Issues: {len(sle_creation_failures) + len(repost_entry_failures) + len(skipped_items)}")
+		error_message_parts.append(f"{'='*80}")
+		
+		# Create single consolidated error log
+		frappe.log_error(
+			title="Item-Based Reposting - Consolidated Failures and Skipped Items",
+			message="\n".join(error_message_parts)
+		)
+	
+	# Log other errors (for transaction-based reposting or general errors)
 	if errors:
 		frappe.log_error(
 			f"Total errors: {len(errors)}\n\n" + "\n".join(errors[:20]),  # Log first 20 errors
@@ -977,6 +1339,350 @@ def _create_repost_entries_from_transactions(transactions):
 		"created": created,
 		"skipped": skipped,
 		"skip_reasons": skip_reasons,
-		"errors_count": len(errors)
+		"errors_count": len(errors),
+		"sle_creation_failures": len(sle_creation_failures) if item_based_reposting else 0,
+		"repost_entry_failures": len(repost_entry_failures) if item_based_reposting else 0,
+		"skipped_items_count": len(skipped_items) if item_based_reposting else 0
 	}
 
+
+@frappe.whitelist()
+def process_transactions_chronologically(start_date=None, end_date=None, transaction_doctype=None, enqueue=False):
+	"""Process transactions chronologically: Create SLEs and Repost Item Valuation entries
+	
+	This method processes all transactions in chronological order (oldest to latest),
+	creating Stock Ledger Entries first, then Repost Item Valuation entries.
+	Only SLE creation failures are logged as errors (not "repost entry already exists").
+	
+	Args:
+		start_date: Start date for transactions (default: 2000-01-01)
+		end_date: End date for transactions (default: today)
+		transaction_doctype: Filter by specific doctype (optional)
+		enqueue: If True, run in background using RQ (default: False)
+	"""
+	if enqueue:
+		job = frappe.enqueue(
+			"back_office.stock_tools.api._process_transactions_chronologically_background",
+			start_date=start_date,
+			end_date=end_date,
+			transaction_doctype=transaction_doctype,
+			queue="long",
+			timeout=7200,  # 2 hour timeout
+			job_name=f"Process Transactions Chronologically - {frappe.session.user}"
+		)
+		return {"job_id": job.id, "status": "queued"}
+	else:
+		return _process_transactions_chronologically_background(start_date, end_date, transaction_doctype)
+
+
+def _process_transactions_chronologically_background(start_date=None, end_date=None, transaction_doctype=None):
+	"""Background function to process transactions chronologically"""
+	try:
+		frappe.flags.in_progress = True
+		
+		start_date = start_date or "2000-01-01"
+		end_date = end_date or today()
+		doctype_filter = transaction_doctype if transaction_doctype else None
+		
+		# Get all transactions in chronological order
+		frappe.publish_realtime("stock_maintenance_progress", {
+			"stage": "Fetching transactions chronologically...",
+			"progress": 0
+		})
+		
+		all_transactions = _get_all_transactions_chronological(start_date, end_date, doctype_filter)
+		
+		if not all_transactions:
+			frappe.publish_realtime("stock_maintenance_progress", {
+				"stage": "Completed",
+				"progress": 100,
+				"sles_created": 0,
+				"repost_entries_created": 0,
+				"sle_failures": 0
+			})
+			return {
+				"sles_created": 0,
+				"repost_entries_created": 0,
+				"sle_failures": 0,
+				"status": "completed"
+			}
+		
+		frappe.logger().info(
+			f"Processing {len(all_transactions)} transactions chronologically "
+			f"from {start_date} to {end_date}"
+		)
+		
+		# Track results
+		sles_created = 0
+		repost_entries_created = 0
+		sle_creation_failures = []  # List of dicts: {doctype, voucher_no, item_code, warehouse, error}
+		
+		# Process each transaction chronologically
+		for idx, trans in enumerate(all_transactions, 1):
+			doctype = trans.get("doctype")
+			voucher_no = trans.get("name")
+			
+			if not doctype or not voucher_no:
+				continue
+			
+			# Verify transaction exists and is submitted
+			if not frappe.db.exists(doctype, voucher_no):
+				continue
+			
+			docstatus = frappe.db.get_value(doctype, voucher_no, "docstatus")
+			if docstatus != 1:
+				continue
+			
+			try:
+				doc = frappe.get_doc(doctype, voucher_no)
+				
+				# Step 1: Create Stock Ledger Entries
+				try:
+					# Check if SLEs already exist
+					existing_sles_count = frappe.db.count(
+						"Stock Ledger Entry",
+						{
+							"voucher_type": doctype,
+							"voucher_no": voucher_no,
+							"is_cancelled": 0
+						}
+					)
+					
+					if existing_sles_count == 0:
+						# Create SLEs
+						if doctype == "Stock Reconciliation":
+							# Special handling for Stock Reconciliation
+							sles_result = _create_stock_reconciliation_sles(doc)
+							created_count = sles_result.get("created", 0)
+							failed_items = sles_result.get("failed_items", [])
+							
+							# Track failed items
+							for failed_item in failed_items:
+								sle_creation_failures.append({
+									"doctype": doctype,
+									"voucher_no": voucher_no,
+									"item_code": failed_item.get("item_code", "N/A"),
+									"warehouse": failed_item.get("warehouse", "N/A"),
+									"error": failed_item.get("error", "Unknown error")
+								})
+							
+							if created_count > 0:
+								frappe.db.commit()
+								sles_created += created_count
+						elif hasattr(doc, "update_stock_ledger"):
+							try:
+								doc.update_stock_ledger(allow_negative_stock=True)
+								frappe.db.commit()
+								
+								# Verify SLEs were created
+								new_sles_count = frappe.db.count(
+									"Stock Ledger Entry",
+									{
+										"voucher_type": doctype,
+										"voucher_no": voucher_no,
+										"is_cancelled": 0
+									}
+								)
+								
+								if new_sles_count == 0:
+									# No SLEs created - track failure
+									item_warehouses = _get_item_warehouse_combinations(doctype, voucher_no)
+									error_msg = "No Stock Ledger Entries were created (items may have zero quantity or invalid data)"
+									
+									if not item_warehouses:
+										sle_creation_failures.append({
+											"doctype": doctype,
+											"voucher_no": voucher_no,
+											"item_code": "Multiple/Unknown",
+											"warehouse": "Multiple/Unknown",
+											"error": error_msg
+										})
+									else:
+										for item_code, warehouse in item_warehouses:
+											sle_creation_failures.append({
+												"doctype": doctype,
+												"voucher_no": voucher_no,
+												"item_code": item_code,
+												"warehouse": warehouse,
+												"error": error_msg
+											})
+								else:
+									sles_created += new_sles_count
+							except Exception as sle_error:
+								# Track SLE creation failure
+								item_warehouses = _get_item_warehouse_combinations(doctype, voucher_no)
+								error_msg = str(sle_error)
+								
+								if not item_warehouses:
+									sle_creation_failures.append({
+										"doctype": doctype,
+										"voucher_no": voucher_no,
+										"item_code": "Multiple/Unknown",
+										"warehouse": "Multiple/Unknown",
+										"error": error_msg
+									})
+								else:
+									for item_code, warehouse in item_warehouses:
+										sle_creation_failures.append({
+											"doctype": doctype,
+											"voucher_no": voucher_no,
+											"item_code": item_code,
+											"warehouse": warehouse,
+											"error": error_msg
+										})
+								frappe.db.rollback()
+				except Exception as sle_error:
+					# General exception during SLE creation
+					item_warehouses = _get_item_warehouse_combinations(doctype, voucher_no)
+					error_msg = str(sle_error)
+					
+					if not item_warehouses:
+						sle_creation_failures.append({
+							"doctype": doctype,
+							"voucher_no": voucher_no,
+							"item_code": "Unknown",
+							"warehouse": "Unknown",
+							"error": error_msg
+						})
+					else:
+						for item_code, warehouse in item_warehouses:
+							sle_creation_failures.append({
+								"doctype": doctype,
+								"voucher_no": voucher_no,
+								"item_code": item_code,
+								"warehouse": warehouse,
+								"error": error_msg
+							})
+					frappe.db.rollback()
+				
+				# Step 2: Create Repost Item Valuation entries (transaction-based)
+				# Only create if repost entry doesn't already exist
+				existing_repost = frappe.db.exists(
+					"Repost Item Valuation",
+					{
+						"voucher_type": doctype,
+						"voucher_no": voucher_no,
+						"docstatus": ["!=", 2]  # Not cancelled
+					}
+				)
+				
+				if not existing_repost:
+					try:
+						repost_doc = frappe.get_doc({
+							"doctype": "Repost Item Valuation",
+							"based_on": "Transaction",
+							"voucher_type": doctype,
+							"voucher_no": voucher_no,
+							"recreate_stock_ledgers": 1,
+							"allow_negative_stock": 1,
+							"allow_zero_rate": 0
+						})
+						
+						repost_doc.insert(ignore_permissions=True)
+						frappe.db.commit()
+						
+						# Submit the repost entry
+						frappe.flags.ignore_permissions = True
+						try:
+							repost_doc.submit()
+						finally:
+							frappe.flags.ignore_permissions = False
+						frappe.db.commit()
+						
+						repost_entries_created += 1
+					except Exception:
+						# Silently skip repost entry creation errors (don't log as failures)
+						frappe.db.rollback()
+				
+			except Exception as e:
+				# Log general transaction errors but continue
+				frappe.log_error(
+					title=f"Error processing {doctype} {voucher_no}",
+					message=str(e)
+				)
+				frappe.db.rollback()
+			
+			# Progress update every 50 transactions
+			if idx % 50 == 0:
+				progress_pct = int((idx / len(all_transactions)) * 100)
+				frappe.publish_realtime("stock_maintenance_progress", {
+					"stage": f"Processing transactions... ({idx}/{len(all_transactions)})",
+					"progress": progress_pct,
+					"current": idx,
+					"total": len(all_transactions),
+					"sles_created": sles_created,
+					"repost_entries_created": repost_entries_created,
+					"sle_failures": len(sle_creation_failures)
+				})
+				frappe.db.commit()
+		
+		frappe.db.commit()
+		
+		# Create consolidated error log for SLE creation failures
+		if sle_creation_failures:
+			error_message_parts = []
+			error_message_parts.append(f"\n{'='*80}")
+			error_message_parts.append(f"STOCK LEDGER ENTRY CREATION FAILURES ({len(sle_creation_failures)} items)")
+			error_message_parts.append(f"{'='*80}\n")
+			error_message_parts.append(f"{'Transaction':<35} {'Item Code':<25} {'Warehouse':<25} {'Error'}")
+			error_message_parts.append("-" * 90)
+			
+			for failure in sle_creation_failures:
+				transaction = f"{failure['doctype']} - {failure['voucher_no']}"
+				if len(transaction) > 34:
+					transaction = transaction[:31] + "..."
+				item_code = failure.get('item_code', 'N/A')
+				if len(item_code) > 24:
+					item_code = item_code[:21] + "..."
+				warehouse = failure.get('warehouse', 'N/A')
+				if len(warehouse) > 24:
+					warehouse = warehouse[:21] + "..."
+				error = failure.get('error', 'Unknown error')
+				if len(error) > 50:
+					error = error[:47] + "..."
+				error_message_parts.append(f"{transaction:<35} {item_code:<25} {warehouse:<25} {error}")
+			
+			error_message_parts.append(f"\n{'='*80}")
+			error_message_parts.append(f"SUMMARY: {len(sle_creation_failures)} SLE creation failures")
+			error_message_parts.append(f"{'='*80}")
+			
+			frappe.log_error(
+				title="Chronological Processing - SLE Creation Failures",
+				message="\n".join(error_message_parts)
+			)
+		
+		# Publish completion
+		frappe.publish_realtime("stock_maintenance_progress", {
+			"stage": "Completed",
+			"progress": 100,
+			"sles_created": sles_created,
+			"repost_entries_created": repost_entries_created,
+			"sle_failures": len(sle_creation_failures)
+		})
+		
+		frappe.logger().info(
+			f"Chronological processing completed: "
+			f"SLEs created: {sles_created}, "
+			f"Repost entries created: {repost_entries_created}, "
+			f"SLE failures: {len(sle_creation_failures)}"
+		)
+		
+		return {
+			"sles_created": sles_created,
+			"repost_entries_created": repost_entries_created,
+			"sle_failures": len(sle_creation_failures),
+			"status": "completed"
+		}
+		
+	except Exception as e:
+		error_msg = str(e)
+		frappe.log_error(frappe.get_traceback(), "Chronological Processing Error")
+		frappe.publish_realtime("stock_maintenance_progress", {
+			"stage": "Error",
+			"error": error_msg,
+			"progress": 0
+		})
+		raise
+	finally:
+		frappe.flags.in_progress = False
+		frappe.db.commit()
